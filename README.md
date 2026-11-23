@@ -38,6 +38,9 @@ python train.py --name baseline_x2
 
 # continue an interrupted run
 python train.py --name baseline_x2 --resume
+
+# Alternative: wandb, this will put the log, including val image on wandb.ai. Flag --resume is also available in this mode
+python train.py --name baseline_x2 --wandb
 ```
 
 Defaults: ×2, 64 channels, 16 blocks, L1 loss, Adam with lr 2e-4 (halved at 50% and 75% of `--iterations`), batch of 16 patches (48×48 LR), 8 crops per decoded image, validation on Set5 every 1000 iterations.
