@@ -13,11 +13,13 @@ import argparse
 import csv
 import time
 from pathlib import Path
+import matplotlib.pyplot as plt
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from sr import metrics
 from sr.data import SREvalDataset, SRTrainDataset
 from sr.metrics import psnr, ssim
 from sr.models import SuperResolutionNet, count_parameters
@@ -42,19 +44,81 @@ def parse_args():
     return p.parse_args()
 
 
+
+def draw_PSNR(PSNR, outpath: Path):
+    """Draw PSNR curves from the CSV log."""
+    plt.figure(figsize=(8, 4))
+    plt.plot(PSNR, label="PSNR")
+    plt.xlabel("Iteration (K)")
+    plt.ylabel("PSNR (dB)")
+    plt.title("PSNR (Validation)")
+    plt.legend()
+    plt.grid()
+    plt.savefig(outpath)
+    plt.close()
+
+
+
+def draw_SSIM(SSIM, outpath: Path):
+    """Draw SSIM curves from the CSV log."""
+    plt.figure(figsize=(8, 4))
+    plt.plot(SSIM, label="SSIM")
+    plt.xlabel("Iteration (K)")
+    plt.ylabel("SSIM")
+    plt.title("SSIM (Validation)")
+    plt.legend()
+    plt.grid()
+    plt.savefig(outpath)
+    plt.close()
+
+
+
+def draw_losses(train_loss, val_loss, outpath: Path):
+    """Draw training loss curve from the CSV log."""
+    plt.figure(figsize=(8, 4))
+    plt.plot(train_loss, label="Train Loss")
+    plt.plot(val_loss, label="Validation Loss")
+    plt.xlabel("Iteration (K)")
+    plt.ylabel("Loss")
+    plt.title("Training Loss")
+    plt.legend()
+    plt.grid()
+    plt.savefig(outpath)
+    plt.close()
+
+
+def analyze_training_log(log_path: Path):
+    """Draw loss and accuracy curves from the CSV log."""
+    iterations, train_loss, val_psnr, val_ssim, val_loss = [], [], [], [], []
+    with open(log_path) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            iterations.append(int(row["iteration"]))
+            train_loss.append(float(row["train_loss"]))
+            val_psnr.append(float(row["val_psnr"]))
+            val_ssim.append(float(row["val_ssim"]))
+            val_loss.append(float(row["val_loss"]))
+    out_dir = log_path.parent
+    draw_PSNR(val_psnr, out_dir / "PSNR.png")
+    draw_SSIM(val_ssim, out_dir / "SSIM.png")
+    draw_losses(train_loss, val_loss, out_dir / "loss.png")
+
+
 @torch.no_grad()
-def validate(model, dataset, device) -> tuple[float, float]:
+def validate(model, dataset, device, loss_function) -> tuple[float, float, float]:
     model.eval()
     psnr_sum = 0.0
     ssim_sum = 0.0
+    loss_sum = 0.0
     for lr, hr, _ in dataset:
         lr = lr.unsqueeze(0).to(device)
         hr = hr.unsqueeze(0).to(device)
         sr = model(lr)
         psnr_sum += psnr(sr, hr, crop=dataset.scale).item()
         ssim_sum += ssim(sr, hr, crop=dataset.scale).item()
+        loss_sum += loss_function(sr, hr).item()
     model.train()
-    return psnr_sum / len(dataset), ssim_sum / len(dataset)
+    return psnr_sum / len(dataset), ssim_sum / len(dataset), loss_sum / len(dataset)
 
 
 def main():
@@ -92,7 +156,7 @@ def main():
     log_file = open(out / "log.csv", "a" if args.resume else "w", newline="")
     log = csv.writer(log_file)
     if not args.resume:
-        log.writerow(["iteration", "train_loss", "lr", "val_psnr", "val_ssim"])
+        log.writerow(["iteration", "train_loss", "lr", "val_psnr", "val_ssim", "val_loss"])
 
     def save(path):
         torch.save({
@@ -121,12 +185,12 @@ def main():
             if iteration % args.val_every == 0 or iteration == args.iterations:
                 n = args.val_every if iteration % args.val_every == 0 else iteration % args.val_every
                 avg_loss = loss_sum / n
-                val_psnr, val_ssim = validate(model, val_dataset, device)
+                val_psnr, val_ssim, val_loss = validate(model, val_dataset, device, F.l1_loss)
                 current_lr = optimizer.param_groups[0]["lr"]
                 speed = n / (time.time() - t0)
                 print(f"Iteration {iteration}/{args.iterations}  loss {avg_loss:.5f}  lr {current_lr:.1e}  "
-                      f"val PSNR {val_psnr:.3f}  SSIM {val_ssim:.4f}  ({speed:.1f} it/s)")
-                log.writerow([iteration, avg_loss, current_lr, val_psnr, val_ssim])
+                      f"val PSNR {val_psnr:.3f}  SSIM {val_ssim:.4f}  Loss {val_loss:.5f}  ({speed:.1f} it/s)")
+                log.writerow([iteration, avg_loss, current_lr, val_psnr, val_ssim, val_loss])
                 log_file.flush()
                 if val_psnr > best_psnr:
                     best_psnr = val_psnr
@@ -139,6 +203,8 @@ def main():
 
     log_file.close()
     print(f"Done. Best val PSNR {best_psnr:.3f} dB -> {out / 'best.pt'}")
+
+    analyze_training_log(out / "log.csv")
 
 
 if __name__ == "__main__":

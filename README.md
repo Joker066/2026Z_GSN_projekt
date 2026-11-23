@@ -71,7 +71,7 @@ Evaluating Set5, Set14 and DIV2K valid takes about 4 min.
 
 The PDF (slide 2) sketches the module: `AdaptiveAvgPool2d(1)` → 1×1 conv (C → C/r) → ReLU → 1×1 conv (C/r → C) → Sigmoid, then multiply it with the input.
 
-I think this part will changes these files:
+I think this part will change these files:
 - **`sr/models.py`:** `ResidualBlock.forward` computes `y = conv2(relu(conv1(x)))` and returns `x + y`. The slide applies attention to `y` just before the addition. Some kind of on/off switch on `ResidualBlock` / `SuperResolutionNet` would let one model class cover both sides of the ablation.
 - **`train.py`:** builds the model from CLI args and saves them in `checkpoint["args"]`, so a new flag there gets stored automatically.
 - **`evaluate.py`:** `load_checkpoint` rebuilds the model from those saved args. It will probably need to read the new flag too, with a default so the existing baseline checkpoint still loads.
