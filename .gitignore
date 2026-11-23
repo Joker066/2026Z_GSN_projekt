@@ -4,4 +4,4 @@ results/
 __pycache__/
 *.pt
 .venv/
-P1_chearsheet.md
+P1_cheatsheet.md

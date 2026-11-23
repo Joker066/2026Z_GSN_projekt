@@ -19,6 +19,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+import wandb
+
 from sr import metrics
 from sr.data import SREvalDataset, SRTrainDataset
 from sr.metrics import psnr, ssim
@@ -41,15 +43,17 @@ def parse_args():
     p.add_argument("--workers", type=int, default=16)
     p.add_argument("--val-every", type=int, default=1000)
     p.add_argument("--resume", action="store_true", help="continue from runs/<name>/last.pt")
+    p.add_argument("--run-id", type=str, default=None, help="W&B run ID to continue (default: the one saved in last.pt)")
+    p.add_argument("--wandb", action="store_true", help="log to Weights & Biases")
     return p.parse_args()
 
 
 
-def draw_PSNR(PSNR, outpath: Path):
+def draw_PSNR(iterations, PSNR, outpath: Path):
     """Draw PSNR curves from the CSV log."""
     plt.figure(figsize=(8, 4))
-    plt.plot(PSNR, label="PSNR")
-    plt.xlabel("Iteration (K)")
+    plt.plot(iterations, PSNR, label="PSNR")
+    plt.xlabel("Iteration")
     plt.ylabel("PSNR (dB)")
     plt.title("PSNR (Validation)")
     plt.legend()
@@ -59,11 +63,11 @@ def draw_PSNR(PSNR, outpath: Path):
 
 
 
-def draw_SSIM(SSIM, outpath: Path):
+def draw_SSIM(iterations, SSIM, outpath: Path):
     """Draw SSIM curves from the CSV log."""
     plt.figure(figsize=(8, 4))
-    plt.plot(SSIM, label="SSIM")
-    plt.xlabel("Iteration (K)")
+    plt.plot(iterations, SSIM, label="SSIM")
+    plt.xlabel("Iteration")
     plt.ylabel("SSIM")
     plt.title("SSIM (Validation)")
     plt.legend()
@@ -73,12 +77,12 @@ def draw_SSIM(SSIM, outpath: Path):
 
 
 
-def draw_losses(train_loss, val_loss, outpath: Path):
+def draw_losses(iterations, train_loss, val_loss, outpath: Path):
     """Draw training loss curve from the CSV log."""
     plt.figure(figsize=(8, 4))
-    plt.plot(train_loss, label="Train Loss")
-    plt.plot(val_loss, label="Validation Loss")
-    plt.xlabel("Iteration (K)")
+    plt.plot(iterations, train_loss, label="Train Loss")
+    plt.plot(iterations, val_loss, label="Validation Loss")
+    plt.xlabel("Iteration")
     plt.ylabel("Loss")
     plt.title("Training Loss")
     plt.legend()
@@ -99,26 +103,30 @@ def analyze_training_log(log_path: Path):
             val_ssim.append(float(row["val_ssim"]))
             val_loss.append(float(row["val_loss"]))
     out_dir = log_path.parent
-    draw_PSNR(val_psnr, out_dir / "PSNR.png")
-    draw_SSIM(val_ssim, out_dir / "SSIM.png")
-    draw_losses(train_loss, val_loss, out_dir / "loss.png")
+    draw_PSNR(iterations, val_psnr, out_dir / "PSNR.png")
+    draw_SSIM(iterations, val_ssim, out_dir / "SSIM.png")
+    draw_losses(iterations, train_loss, val_loss, out_dir / "loss.png")
 
 
 @torch.no_grad()
-def validate(model, dataset, device, loss_function) -> tuple[float, float, float]:
+def validate(model, dataset, device, loss_function) -> tuple[float, float, float, torch.Tensor]:
+    """Returns avg PSNR, SSIM, loss and the SR output [3,H,W] of the first image (for logging)."""
     model.eval()
     psnr_sum = 0.0
     ssim_sum = 0.0
     loss_sum = 0.0
+    sample = None
     for lr, hr, _ in dataset:
         lr = lr.unsqueeze(0).to(device)
         hr = hr.unsqueeze(0).to(device)
         sr = model(lr)
+        if sample is None:
+            sample = sr[0]
         psnr_sum += psnr(sr, hr, crop=dataset.scale).item()
         ssim_sum += ssim(sr, hr, crop=dataset.scale).item()
         loss_sum += loss_function(sr, hr).item()
     model.train()
-    return psnr_sum / len(dataset), ssim_sum / len(dataset), loss_sum / len(dataset)
+    return psnr_sum / len(dataset), ssim_sum / len(dataset), loss_sum / len(dataset), sample
 
 
 def main():
@@ -136,14 +144,32 @@ def main():
     milestones = [args.iterations // 2, args.iterations * 3 // 4]
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=0.5)
 
-    iteration, best_psnr = 0, 0.0
+    iteration, best_psnr, run_id = 0, 0.0, None
     if args.resume and (out / "last.pt").exists():
         ckpt = torch.load(out / "last.pt", map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         iteration, best_psnr = ckpt["iteration"], ckpt["best_psnr"]
+        run_id = ckpt.get("run_id")  # .get: older checkpoints have no run_id
         print(f"Resumed at iteration {iteration}, best PSNR {best_psnr:.3f}")
+    if args.run_id:  # manual override
+        run_id = args.run_id
+
+    # After the checkpoint load, so a resumed run continues the same W&B run.
+    run = None
+    if not args.wandb:
+        wandb.init(mode="disabled")
+    else:
+        run = wandb.init(
+            project="super-resolution",
+            name=args.name,
+            config=vars(args),
+            dir=out,  # W&B's local files go to runs/<name>/wandb/ (ignored by git)
+            id=run_id,  # None -> new run
+            resume="allow",
+        )
+        print(f"W&B run id: {run.id}")
 
     train_dataset = SRTrainDataset(hr_dir=args.train_dir, scale=args.scale, lr_patch=args.lr_patch,
                                    crops_per_image=args.crops_per_image)
@@ -165,6 +191,7 @@ def main():
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
+            "run_id": run.id if run else None,
             "args": vars(args),
         }, path)
 
@@ -185,13 +212,23 @@ def main():
             if iteration % args.val_every == 0 or iteration == args.iterations:
                 n = args.val_every if iteration % args.val_every == 0 else iteration % args.val_every
                 avg_loss = loss_sum / n
-                val_psnr, val_ssim, val_loss = validate(model, val_dataset, device, F.l1_loss)
+                val_psnr, val_ssim, val_loss, sample = validate(model, val_dataset, device, F.l1_loss)
                 current_lr = optimizer.param_groups[0]["lr"]
                 speed = n / (time.time() - t0)
                 print(f"Iteration {iteration}/{args.iterations}  loss {avg_loss:.5f}  lr {current_lr:.1e}  "
                       f"val PSNR {val_psnr:.3f}  SSIM {val_ssim:.4f}  Loss {val_loss:.5f}  ({speed:.1f} it/s)")
                 log.writerow([iteration, avg_loss, current_lr, val_psnr, val_ssim, val_loss])
                 log_file.flush()
+                # wandb.Image expects uint8 in [0, 255] - it does NOT rescale [0, 1] floats (just casts -> black)
+                img_hwc = sample.clamp(0, 1).mul(255).round().byte().permute(1, 2, 0).cpu().numpy()
+                wandb.log({
+                    "train/loss": avg_loss,
+                    "val/psnr": val_psnr,
+                    "val/ssim": val_ssim,
+                    "val/loss": val_loss,
+                    "lr": current_lr,
+                    "val/sample": wandb.Image(img_hwc, caption=f"SR, iteration {iteration}"),
+                }, step=iteration)
                 if val_psnr > best_psnr:
                     best_psnr = val_psnr
                     save(out / "best.pt")
@@ -202,6 +239,7 @@ def main():
                 break
 
     log_file.close()
+    wandb.finish()
     print(f"Done. Best val PSNR {best_psnr:.3f} dB -> {out / 'best.pt'}")
 
     analyze_training_log(out / "log.csv")
